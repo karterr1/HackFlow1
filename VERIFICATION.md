@@ -3,7 +3,10 @@
 Проверено 14 ноября 2026 года.
 
 - `npm ci` / установка по package-lock и `npm run build`: production-сборка React/Vite успешна.
-- API pytest: 5 passed на SQLite, 5 passed на PostgreSQL 16.
+- API pytest после исправлений: 11 passed на SQLite и 11 passed на PostgreSQL 16.
+- Клиент API: 3 passed (`node --test frontend/src/api.test.js`): обновление CSRF, отсутствие повтора обычных ошибок, диагностика недоступного сервера.
+- Новый локальный запуск `run_local.py`: успешно собирает React, применяет миграции и запускает один HTTP-сервер.
+- HTTP-проверка локального сервера: регистрация → допуск организатором → вступление в команду → задача → чат; production JS/CSS возвращают 200.
 - Начальная миграция Alembic успешно применена на PostgreSQL 16.
 - Демонстрационные данные успешно созданы на PostgreSQL.
 - Flask test client: `/` и обе ссылки JS/CSS из собранного HTML возвращают 200; содержимое соответствует production-сборке.

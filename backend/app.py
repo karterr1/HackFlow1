@@ -5,7 +5,7 @@ from flask import Flask, Blueprint, request, jsonify, abort, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-from flask_wtf.csrf import CSRFProtect, generate_csrf
+from flask_wtf.csrf import CSRFProtect, CSRFError, generate_csrf
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -128,6 +128,9 @@ def create_app(config=None):
         u=db.session.get(User,int(uid)); return u if u and not u.blocked else None
     @login.unauthorized_handler
     def unauthorized(): return jsonify(error='Войдите в аккаунт'),401
+    @app.errorhandler(CSRFError)
+    def csrf_error(e):
+        return jsonify(error='Срок защитного токена истёк. Повторите действие.', code='csrf_failed'),400
     @app.errorhandler(HTTPException)
     def error(e): return jsonify(error=e.description),e.code
     @app.errorhandler(IntegrityError)
@@ -175,7 +178,7 @@ def create_app(config=None):
     @login_required
     def space(hid):
         h=gethack(hid);m=Member.query.filter_by(hack_id=hid,user_id=current_user.id).first()
-        return jsonify(hack=dump(h),cases=[dump(c) for c in Case.query.filter_by(hack_id=hid)],teams=[dump(t,['id','name','captain','case_id']) for t in Team.query.filter_by(hack_id=hid)],team_id=m.team_id if m else None,resources=[dump(r) for r in Resource.query.filter_by(hack_id=hid)],completed=[p.resource_id for p in Progress.query.filter_by(user_id=current_user.id)],manager=current_user.role=='admin' or h.owner==current_user.id)
+        return jsonify(hack=dump(h),cases=[dump(c) for c in Case.query.filter_by(hack_id=hid)],teams=[dump(t,['id','name','captain','case_id']) for t in Team.query.filter_by(hack_id=hid)],team_id=m.team_id if m else None,resources=[dump(r) for r in Resource.query.filter_by(hack_id=hid)],completed=[p.resource_id for p in Progress.query.join(Resource, Progress.resource_id==Resource.id).filter(Progress.user_id==current_user.id,Resource.hack_id==hid,Resource.kind=='material')],manager=current_user.role=='admin' or h.owner==current_user.id)
     @api.post('/hacks')
     @login_required
     def create_hack():
@@ -230,7 +233,9 @@ def create_app(config=None):
             if d['status'] not in ('todo','doing','review','done'):abort(400)
             t.status=d['status']
         if 'title' in d:t.title=text(d,'title')
-        if 'description' in d:t.description=text(d,'description',5000)
+        if 'description' in d:
+            if not isinstance(d['description'],str) or len(d['description'])>5000:abort(400)
+            t.description=d['description'].strip()
         if 'assignee' in d:
             if d['assignee'] is not None and not Member.query.filter_by(team_id=t.team_id,user_id=d['assignee']).first():abort(400)
             t.assignee=d['assignee']
@@ -252,6 +257,7 @@ def create_app(config=None):
     @login_required
     def complete(rid):
         r=db.get_or_404(Resource,rid);gethack(r.hack_id)
+        if r.kind!='material':abort(400,description='Отметка изучения доступна только для учебных материалов')
         p=Progress.query.filter_by(user_id=current_user.id,resource_id=rid).first()
         if p:db.session.delete(p)
         else:db.session.add(Progress(user_id=current_user.id,resource_id=rid))
@@ -284,7 +290,10 @@ def create_app(config=None):
         else:emails=[text(data(),'email').lower()]
         if any('@' not in e or len(e)>200 for e in emails):abort(400)
         for e in set(emails):
-            if not Admission.query.filter_by(hack_id=hid,email=e).first():db.session.add(Admission(hack_id=hid,email=e))
+            if not Admission.query.filter_by(hack_id=hid,email=e).first():
+                db.session.add(Admission(hack_id=hid,email=e))
+                u=User.query.filter_by(email=e).first()
+                if u:db.session.add(Notice(user_id=u.id,text='Вы допущены к хакатону «'+h.name+'». Обновите список хакатонов.'))
         db.session.add(Audit(user_id=current_user.id,action=f'Импорт допуска: {hid}, {len(emails)}'));db.session.commit();return jsonify(ok=True,count=len(emails))
     @api.route('/hacks/<int:hid>/resources',methods=['POST'])
     @login_required
@@ -346,10 +355,23 @@ def create_app(config=None):
     return app
 
 def seed_data():
-    if User.query.first():return
     people=[]
     for name,role in [('captain','participant'),('member','participant'),('organizer','organizer'),('jury','jury')]:
-        u=User(email=f'{name}@hackflow.local',nick={'captain':'Александр','member':'Мария','organizer':'Организатор','jury':'Эксперт'}[name],role=role,password=generate_password_hash('HackFlow2026!'));db.session.add(u);people.append(u)
+        u=User.query.filter_by(email=f'{name}@hackflow.local').first()
+        if u:
+            if u.role!=role:
+                raise RuntimeError('Демо-email уже занят другим типом аккаунта: '+u.email)
+        else:
+            nick={'captain':'Александр','member':'Мария','organizer':'Организатор','jury':'Эксперт'}[name]
+            base=nick;counter=1
+            while User.query.filter_by(nick=nick).first():
+                nick=f'{base} (демо {counter})';counter+=1
+            u=User(email=f'{name}@hackflow.local',nick=nick,role=role,password=generate_password_hash('HackFlow2026!'))
+            db.session.add(u);db.session.flush()
+        people.append(u)
+    existing=Hack.query.filter_by(owner=people[2].id,name='Актион × IT Hack 2026').first()
+    if existing:
+        db.session.commit();return
     db.session.flush();h=Hack(name='Актион × IT Hack 2026',description='Создаём цифровые продукты для образования. От идеи — до работающего решения в одной команде.',start=now()-timedelta(days=1),deadline=now()+timedelta(days=7),owner=people[2].id);db.session.add(h);db.session.flush()
     for u in people[:2]:db.session.add(Admission(hack_id=h.id,email=u.email))
     c=Case(hack_id=h.id,title='Единая среда студенческого хакатона',body='Разработайте платформу, объединяющую командную работу, обучение и сдачу проекта. Заказчик: Актион. Результат: работающий MVP и презентация.');db.session.add(c);db.session.flush()

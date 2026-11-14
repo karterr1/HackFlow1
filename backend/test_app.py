@@ -71,3 +71,58 @@ def test_team_privacy(app):
     assert a.get(f"/api/teams/{other['id']}").status_code==403
     assert a.get(f"/api/teams/{other['id']}/messages").status_code==403
     assert post(a,f"/teams/{other['id']}/tasks",{'title':'Атака'}).status_code==403
+
+def test_registered_user_gets_access_after_organizer_admission(app):
+    newcomer=app.test_client();org=app.test_client()
+    assert post(newcomer,'/register',{'email':'new@example.com','nick':'Новый участник','password':'HackFlow2026!'}).status_code==201
+    assert newcomer.get('/api/me').status_code==200
+    assert not newcomer.get('/api/hacks').json[0]['admitted']
+    assert newcomer.get('/api/hacks/1/space').status_code==403
+    signin(org,'organizer')
+    assert post(org,'/hacks/1/admissions',{'email':'new@example.com'}).status_code==200
+    assert newcomer.get('/api/hacks').json[0]['admitted']
+    assert newcomer.get('/api/notices').json[0]['text'].startswith('Вы допущены')
+    assert post(newcomer,'/hacks/1/join',{'code':'HACKFLOW-DEMO'}).status_code==200
+    assert post(newcomer,'/teams/1/tasks',{'title':'Задача нового участника'}).status_code==201
+    assert post(newcomer,'/teams/1/messages',{'text':'Теперь всё доступно'}).json[-1]['text']=='Теперь всё доступно'
+
+def test_invalid_csrf_has_machine_readable_error(app):
+    c=app.test_client();signin(c,'captain')
+    r=c.post('/api/teams/1/tasks',json={'title':'Не создавать'},headers={'X-CSRFToken':'expired'})
+    assert r.status_code==400 and r.json['code']=='csrf_failed'
+    with app.app_context():assert Task.query.filter_by(title='Не создавать').count()==0
+    assert post(c,'/teams/1/tasks',{'title':'Повтор с новым токеном'}).status_code==201
+
+def test_progress_is_scoped_to_hack_and_learning_material(app):
+    c=app.test_client();org=app.test_client();signin(c,'captain');signin(org,'organizer')
+    assert post(c,'/resources/1/complete',{}).status_code==200
+    assert post(c,'/resources/3/complete',{}).status_code==400
+    h=post(org,'/hacks',{'name':'Другой хакатон','start':'2026-01-01T00:00:00','deadline':'2027-01-01T00:00:00'}).json
+    post(org,f"/hacks/{h['id']}/admissions",{'email':'captain@hackflow.local'})
+    assert c.get(f"/api/hacks/{h['id']}/space").json['completed']==[]
+    assert c.get('/api/hacks/1/space').json['completed']==[1]
+
+def test_task_can_clear_optional_description_and_deadline(app):
+    c=app.test_client();signin(c,'captain')
+    r=patch(c,'/tasks/1',{'title':'Новое название','description':'','deadline':None})
+    assert r.status_code==200 and r.json['description']=='' and r.json['deadline'] is None
+
+def test_local_secret_survives_restart(tmp_path):
+    import importlib.util
+    from pathlib import Path
+    spec=importlib.util.spec_from_file_location('run_local',Path(__file__).parents[1]/'run_local.py')
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    one=module.persistent_secret(tmp_path/'instance')
+    assert len(one)>=64 and module.persistent_secret(tmp_path/'instance')==one
+
+def test_seed_can_add_demo_after_registration_without_erasing_user(app):
+    with app.app_context():db.drop_all();db.create_all()
+    c=app.test_client()
+    assert post(c,'/register',{'email':'real@example.com','nick':'Александр','password':'OwnPassword2026!'}).status_code==201
+    with app.app_context():
+        seed_data();seed_data()
+        assert User.query.filter_by(email='real@example.com').one().nick=='Александр'
+        assert User.query.count()==5
+        assert Hack.query.count()==1
+        assert User.query.filter_by(email='organizer@hackflow.local').one().role=='organizer'
+    org=app.test_client();assert signin(org,'organizer').status_code==200
